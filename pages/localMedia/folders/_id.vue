@@ -4,7 +4,7 @@
       <p class="text-base font-semibold">{{ $strings.LabelFolder }}: {{ folderName }}</p>
       <div class="flex-grow" />
 
-      <button v-if="isSelectionMode" class="text-sm text-fg-muted px-2 py-1" @click="clearSelection">{{ $strings.ButtonCancel }}</button>
+      <button v-if="isSelectionMode" class="text-sm text-fg-muted px-2 py-1" :disabled="deletingItems" @click="clearSelection">{{ $strings.ButtonCancel }}</button>
       <span v-if="dialogItems.length" class="material-symbols text-2xl" @click="showDialog = true">more_vert</span>
     </div>
 
@@ -12,20 +12,21 @@
 
     <p class="mb-2 text-base text-fg">{{ $strings.HeaderLocalLibraryItems }} ({{ localLibraryItems.length }})</p>
 
-    <div class="w-full media-item-container overflow-y-auto">
+    <div class="w-full media-item-container overflow-y-auto" :class="{ 'selection-mode': isSelectionMode }">
       <template v-for="localLibraryItem in localLibraryItems">
         <div
           :key="localLibraryItem.id"
           class="flex my-1 rounded selected-media-item"
           :class="{ selected: selectedLocalLibraryItemIds.includes(localLibraryItem.id) }"
+          role="link"
+          tabindex="0"
           @click="clickLocalLibraryItem(localLibraryItem)"
-          @touchstart.passive="startLongPress(localLibraryItem)"
-          @touchend="cancelLongPress"
-          @touchcancel="cancelLongPress"
-          @mousedown="startLongPress(localLibraryItem)"
-          @mouseup="cancelLongPress"
-          @mouseleave="cancelLongPress"
-          @contextmenu.prevent="selectLocalLibraryItem(localLibraryItem)"
+          @keydown.enter="clickLocalLibraryItem(localLibraryItem)"
+          @pointerdown="startLongPress($event, localLibraryItem)"
+          @pointermove="handlePointerMove"
+          @pointerup="cancelLongPress"
+          @pointercancel="cancelLongPress"
+          @contextmenu.prevent
         >
           <div class="w-12 h-12 min-w-12 min-h-12 bg-primary">
             <img v-if="localLibraryItem.coverPathSrc" :src="localLibraryItem.coverPathSrc" class="w-full h-full object-contain" />
@@ -46,9 +47,9 @@
     </div>
 
     <div v-if="isSelectionMode" class="fixed left-0 w-full py-4 px-4 bg-bg box-shadow-book flex items-center" :style="{ bottom: isPlayerOpen ? '120px' : '0px' }">
-      <p class="text-sm text-fg-muted">{{ selectedLocalLibraryItemIds.length }} selected</p>
+      <p class="text-sm text-fg-muted">{{ $getString('LabelSelectedCount', [$formatNumber(selectedLocalLibraryItemIds.length)]) }}</p>
       <div class="flex-grow" />
-      <ui-btn small color="error" :disabled="deletingItems" @click="deleteSelectedItems">{{ deletingItems ? 'Deleting...' : 'Delete selected' }}</ui-btn>
+      <ui-btn small color="error" :disabled="deletingItems" @click="deleteSelectedItems">{{ deletingItems ? $strings.MessageDeleting : $strings.ButtonDeleteSelected }}</ui-btn>
     </div>
 
     <modals-dialog v-model="showDialog" :items="dialogItems" @action="dialogAction" />
@@ -59,6 +60,9 @@
 import { Capacitor } from '@capacitor/core'
 import { Dialog } from '@capacitor/dialog'
 import { AbsFileSystem } from '@/plugins/capacitor'
+
+const LONG_PRESS_DELAY_MS = 500
+const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 
 export default {
   asyncData({ params, query }) {
@@ -74,6 +78,7 @@ export default {
       showDialog: false,
       selectedLocalLibraryItemIds: [],
       longPressTimeout: null,
+      longPressStartPosition: null,
       suppressNextClick: false,
       deletingItems: false
     }
@@ -108,25 +113,43 @@ export default {
     }
   },
   methods: {
-    startLongPress(localLibraryItem) {
+    startLongPress(event, localLibraryItem) {
+      if (!event.isPrimary || event.button !== 0 || this.isSelectionMode) return
+
       this.cancelLongPress()
+      this.suppressNextClick = false
+      this.longPressStartPosition = { x: event.clientX, y: event.clientY }
       this.longPressTimeout = setTimeout(() => {
+        this.longPressTimeout = null
+        this.longPressStartPosition = null
         this.suppressNextClick = true
         this.selectLocalLibraryItem(localLibraryItem)
-      }, 500)
+      }, LONG_PRESS_DELAY_MS)
+    },
+    handlePointerMove(event) {
+      if (!this.longPressStartPosition) return
+
+      const horizontalDistance = Math.abs(event.clientX - this.longPressStartPosition.x)
+      const verticalDistance = Math.abs(event.clientY - this.longPressStartPosition.y)
+      if (horizontalDistance > LONG_PRESS_MOVE_TOLERANCE_PX || verticalDistance > LONG_PRESS_MOVE_TOLERANCE_PX) {
+        this.cancelLongPress()
+      }
     },
     cancelLongPress() {
       if (this.longPressTimeout) {
         clearTimeout(this.longPressTimeout)
         this.longPressTimeout = null
       }
+      this.longPressStartPosition = null
     },
-    async selectLocalLibraryItem(localLibraryItem) {
+    selectLocalLibraryItem(localLibraryItem) {
       this.cancelLongPress()
-      await this.$hapticsImpact()
       this.toggleSelectedLocalLibraryItem(localLibraryItem)
+      this.$hapticsImpact()
     },
     clickLocalLibraryItem(localLibraryItem) {
+      if (this.deletingItems) return
+
       if (this.suppressNextClick) {
         this.suppressNextClick = false
         return
@@ -138,6 +161,8 @@ export default {
       }
     },
     toggleSelectedLocalLibraryItem(localLibraryItem) {
+      if (this.deletingItems) return
+
       const index = this.selectedLocalLibraryItemIds.indexOf(localLibraryItem.id)
       if (index >= 0) {
         this.selectedLocalLibraryItemIds.splice(index, 1)
@@ -146,6 +171,7 @@ export default {
       }
     },
     clearSelection() {
+      if (this.deletingItems) return
       this.selectedLocalLibraryItemIds = []
     },
     getLocalLibraryItemSubText(localLibraryItem) {
@@ -189,33 +215,36 @@ export default {
     async deleteSelectedItems() {
       if (!this.selectedLocalLibraryItems.length || this.deletingItems) return
 
-      const count = this.selectedLocalLibraryItems.length
+      const selectedItems = this.selectedLocalLibraryItems.slice()
+      const count = selectedItems.length
       const { value } = await Dialog.confirm({
         title: this.$strings.HeaderConfirm,
-        message: `Remove local files for ${count} selected item${count === 1 ? '' : 's'} from your device? The files on the server and your progress will be unaffected.`
+        message: count === 1 ? this.$strings.MessageConfirmDeleteSelectedLocalFile : this.$getString('MessageConfirmDeleteSelectedLocalFiles', [this.$formatNumber(count)])
       })
       if (!value) return
 
       this.deletingItems = true
-      const selectedIds = this.selectedLocalLibraryItemIds.slice()
-      const selectedItems = this.selectedLocalLibraryItems.slice()
-      let deletedCount = 0
+      const deletedIds = []
 
-      for (const item of selectedItems) {
-        const res = await AbsFileSystem.deleteItem(item)
-        if (res?.success) {
-          deletedCount++
-          this.localLibraryItems = this.localLibraryItems.filter((localLibraryItem) => localLibraryItem.id !== item.id)
+      try {
+        for (const item of selectedItems) {
+          try {
+            const res = await AbsFileSystem.deleteItem(item)
+            if (res?.success) deletedIds.push(item.id)
+          } catch (error) {
+            console.error(`Failed to delete local library item ${item.id}`, error)
+          }
         }
+      } finally {
+        this.localLibraryItems = this.localLibraryItems.filter((item) => !deletedIds.includes(item.id))
+        this.selectedLocalLibraryItemIds = this.selectedLocalLibraryItemIds.filter((id) => !deletedIds.includes(id))
+        this.deletingItems = false
       }
 
-      this.selectedLocalLibraryItemIds = this.selectedLocalLibraryItemIds.filter((id) => !selectedIds.includes(id))
-      this.deletingItems = false
-
-      if (deletedCount === count) {
+      if (deletedIds.length === count) {
         this.$toast.success('Deleted Successfully')
       } else {
-        this.$toast.error(`Deleted ${deletedCount} of ${count} selected items`)
+        this.$toast.error(this.$getString('MessageDeletedSelectedLocalItems', [this.$formatNumber(deletedIds.length), this.$formatNumber(count)]))
       }
     },
     async init() {
@@ -264,11 +293,19 @@ export default {
   height: calc(100vh - 210px);
   max-height: calc(100vh - 210px);
 }
+.media-item-container.selection-mode {
+  height: calc(100vh - 290px);
+  max-height: calc(100vh - 290px);
+}
 .selected-media-item.selected {
   background-color: rgba(63, 131, 248, 0.12);
 }
 .playerOpen .media-item-container {
   height: calc(100vh - 310px);
   max-height: calc(100vh - 310px);
+}
+.playerOpen .media-item-container.selection-mode {
+  height: calc(100vh - 390px);
+  max-height: calc(100vh - 390px);
 }
 </style>
